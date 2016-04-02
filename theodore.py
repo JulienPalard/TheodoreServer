@@ -196,6 +196,8 @@ async def get_multichannel(request):
     if 'no_wait' in channels:
         timeout = .1
         del channels['no_wait']
+    if len(channels) == 0:
+        return web.Response(status=422)
     message = await request.app['theodore'].get_multiple(
         channels, timeout=timeout)
     if message is None:
