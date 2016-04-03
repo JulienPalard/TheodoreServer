@@ -26,6 +26,10 @@ You can request some stats about a channel with this call:
 
     http://0:7300/?channel1=options[&channel2=options[&no_wait]]
 
+## WebSocket query:
+
+    http://0:7300/?channel1&channel2&channel3
+
 HTTP header responses will contain:
 
  - `X-Id-%s: %u` with `%s` a channel name and `%u` its ID. This header apprear
@@ -36,10 +40,14 @@ HTTP header responses will contain:
 
 """
 
+import json
 import collections
+import asynczip
+import logging
 from asyncio import events, Future, wait, wait_for, FIRST_COMPLETED
-from aiohttp import web
+from aiohttp import web, MsgType
 
+logger = logging.getLogger(__name__)
 
 def date_1123():
     """Get "now" as an RFC 1123 formated string.
@@ -62,6 +70,19 @@ class Message:
         self.data = data
 
 
+class ChannelIterator:
+    def __init__(self, channel, current_id):
+        self.channel = channel
+        self.current_id = current_id
+
+    async def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self.current_id += 1
+        return await self.channel.get_by_id(self.current_id)
+
+
 class Channel:
     """A :class:`Channel` contains messages, each message have an id.
     This class allow querying a message by id, the current message,
@@ -76,6 +97,9 @@ class Channel:
         self.name = name
         self.messages = {}
         self.next_id = 0
+
+    async def __aiter__(self):
+        return ChannelIterator(self, self.next_id)
 
     async def get_next(self):
         """Block until the a new message is available.
@@ -219,9 +243,35 @@ async def get_stats(request):
     return web.Response(body=body.encode('utf-8'))
 
 
+async def get_multichannel_websocket(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    channels = [request.app['theodore'].get_channel(channel) for
+                channel in dict(request.GET).keys()]
+    async for msgs in asynczip.AsyncZip(ws, *channels):
+        if msgs[0].done():
+            msg = msgs[0].result()
+            if msg.tp == MsgType.text:
+                if msg.data == 'close':
+                    await ws.close()
+            elif msg.tp == MsgType.error:
+                logger.debug('ws connection closed with exception %s',
+                             ws.exception())
+        else:
+            for msg in msgs[1:]:
+                if msg.done():
+                    result = msg.result()
+                    data = {'channel': result.channel_name,
+                            'message_id': result.msg_id,
+                            'text': result.data.decode('utf-8')}
+                    ws.send_str(json.dumps(data))
+    return ws
+
+
 def main():
     app = web.Application()
     app['theodore'] = TheodoreServer()
+    app.router.add_route('GET', '/ws', get_multichannel_websocket)
     app.router.add_route('GET', '/{name}', get)
     app.router.add_route('POST', '/{name}', post)
     app.router.add_route('GET', '/', get_multichannel)
